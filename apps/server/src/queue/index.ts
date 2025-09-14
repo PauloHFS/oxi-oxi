@@ -1,11 +1,9 @@
-// src/queue/index.ts
-
 import {
   RabbitMQClient,
   RabbitMQPublisher,
   RabbitMQSubscriber,
 } from "./rabbitmq";
-import { consumer } from "../runners"; // Importa o consumer para ser passado à função de setup
+import { consumer } from "../runners";
 
 export const RABBITMQ_URL =
   process.env.RABBITMQ_URL || "amqp://user:password@localhost:5672";
@@ -56,9 +54,11 @@ export async function setupQueue() {
     ),
   };
 
-  await Promise.all([
-    subscribers.webhook.setup().then((s) => s.startConsuming(consumer)),
-    subscribers.api.setup().then((s) => s.startConsuming(consumer)),
-    subscribers.ollama.setup().then((s) => s.startConsuming(consumer)),
-  ]);
+  const subscriberList = Object.values(subscribers);
+
+  // 1. Configura todas as filas e bindings em paralelo
+  await Promise.all(subscriberList.map((s) => s.setup()));
+
+  // 2. Inicia o consumo em todas as filas em paralelo
+  await Promise.all(subscriberList.map((s) => s.startConsuming(consumer)));
 }

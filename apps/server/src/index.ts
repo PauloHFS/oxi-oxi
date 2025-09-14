@@ -12,9 +12,6 @@ const app = new Elysia()
   .onStart(async () => {
     setupQueue();
   })
-  .onStop(async () => {
-    await rabbitmqClient.close();
-  })
   .use(
     cors({
       origin: process.env.CORS_ORIGIN || "",
