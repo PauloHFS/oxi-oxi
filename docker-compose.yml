@@ -1,4 +1,24 @@
 services:
+  db:
+    image: postgres:16
+    container_name: postgres-oxi-oxi
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: oxi-oxi-db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d oxi-oxi-db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
   rabbitmq:
     image: rabbitmq:3-management
     container_name: rabbitmq-oxi-oxi
@@ -31,6 +51,7 @@ services:
       - backend
 
 volumes:
+  postgres_data:
   rabbitmq_data:
   ollama_data:
 

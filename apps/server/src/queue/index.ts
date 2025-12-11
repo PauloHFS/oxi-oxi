@@ -1,8 +1,4 @@
-import {
-  RabbitMQClient,
-  RabbitMQPublisher,
-  RabbitMQSubscriber,
-} from "./rabbitmq";
+import { initializeRabbitMQ, subscribe, publish } from "./rabbitmq";
 import { consumer } from "../runners";
 
 export const RABBITMQ_URL =
@@ -21,44 +17,37 @@ export const QUEUES = {
   ollama: "ollama_queue",
 };
 
-export const rabbitmqClient = RabbitMQClient.getInstance(
-  RABBITMQ_URL,
-  RABBITMQ_EXCHANGE
-);
 
-export let producer: RabbitMQPublisher | null = null;
-export let subscribers: { [key: string]: RabbitMQSubscriber } | null = null;
+// Re-export the publish function so other modules can use it
+export { publish };
 
+/**
+ * Sets up the entire queue topology and starts the consumers.
+ */
 export async function setupQueue() {
-  await rabbitmqClient.connect();
+  console.log("[...] Configurando as filas e consumidores do RabbitMQ...");
 
-  producer = new RabbitMQPublisher(rabbitmqClient, RABBITMQ_EXCHANGE);
-  subscribers = {
-    webhook: new RabbitMQSubscriber(
-      rabbitmqClient,
+  // 1. Initialize the connection and the main exchange
+  initializeRabbitMQ(RABBITMQ_URL, RABBITMQ_EXCHANGE);
+
+  const prefetchCount = 10; // Number of messages a consumer can handle at once
+
+  // 2. Set up all subscribers in parallel
+  await Promise.all([
+    subscribe(
       QUEUES.webhook,
-      RABBITMQ_EXCHANGE,
-      ROUTING_KEYS.webhook
+      ROUTING_KEYS.webhook,
+      consumer,
+      prefetchCount
     ),
-    api: new RabbitMQSubscriber(
-      rabbitmqClient,
-      QUEUES.api,
-      RABBITMQ_EXCHANGE,
-      ROUTING_KEYS.api
-    ),
-    ollama: new RabbitMQSubscriber(
-      rabbitmqClient,
+    subscribe(QUEUES.api, ROUTING_KEYS.api, consumer, prefetchCount),
+    subscribe(
       QUEUES.ollama,
-      RABBITMQ_EXCHANGE,
-      ROUTING_KEYS.ollama
+      ROUTING_KEYS.ollama,
+      consumer,
+      prefetchCount
     ),
-  };
+  ]);
 
-  const subscriberList = Object.values(subscribers);
-
-  // 1. Configura todas as filas e bindings em paralelo
-  await Promise.all(subscriberList.map((s) => s.setup()));
-
-  // 2. Inicia o consumo em todas as filas em paralelo
-  await Promise.all(subscriberList.map((s) => s.startConsuming(consumer)));
+  console.log("[✓] Todos os consumidores foram configurados com sucesso.");
 }

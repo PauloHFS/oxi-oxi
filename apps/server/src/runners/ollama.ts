@@ -6,13 +6,29 @@ import { edges } from "@/db/schema/edges";
 import { eq, inArray, and } from "drizzle-orm";
 import { z } from "zod";
 import { executions } from "@/db/schema/flows";
-import { producer, ROUTING_KEYS } from "@/queue";
+import { publish, ROUTING_KEYS } from "@/queue";
 
 const OLLAMA_API_URL = process.env.OLLAMA_API_URL || "http://localhost:11434";
 
-interface OllamaRunner extends Runner {}
+const getNodeRoutingKey = (nodeType: string): string => {
+  switch (nodeType) {
+    case "API":
+      return ROUTING_KEYS.api;
+    case "OLLAMA":
+      return ROUTING_KEYS.ollama;
+    case "WEBHOOK":
+      return ROUTING_KEYS.webhook;
+    default:
+      throw new Error(`Tipo de nó desconhecido para roteamento: ${nodeType}`);
+  }
+};
 
-export const OllamaRunner = async ({ executionId, nodeId }: OllamaRunner) => {
+interface OllamaRunnerPayload extends Runner {}
+
+export const OllamaRunner = async ({
+  executionId,
+  nodeId,
+}: OllamaRunnerPayload) => {
   const node = await db.select().from(nodes).where(eq(nodes.id, nodeId)).get();
 
   if (!node) {
@@ -22,13 +38,8 @@ export const OllamaRunner = async ({ executionId, nodeId }: OllamaRunner) => {
     throw new Error(`Node with ID ${nodeId} is not of type OLLAMA.`);
   }
 
-  const CONFIG = z
-    .object({
-      prompt: z.string(),
-    })
-    .parse(node.data);
+  const CONFIG = z.object({ prompt: z.string() }).parse(node.data);
 
-  // pega o id do node anterior
   const incoming_edge = await db
     .select()
     .from(edges)
@@ -40,7 +51,6 @@ export const OllamaRunner = async ({ executionId, nodeId }: OllamaRunner) => {
     throw new Error(`No incoming edge found for node ${nodeId}`);
   }
 
-  // pegar o resultado do node anterior
   const previousNodeResult = await db
     .select()
     .from(node_results)
@@ -60,16 +70,6 @@ export const OllamaRunner = async ({ executionId, nodeId }: OllamaRunner) => {
     );
   }
 
-  // substituir {{replace}} no prompt pelo resultado do node anterior
-  // TODO melhorar isso aqui pra substituir múltiplas ocorrências e talvez permitir mais variáveis
-  // Exemplo: https://stackoverflow.com/questions/1144783/replacing-multiple-occurrences-of-a-string-in-javascript
-  // ou usar alguma template engine mesmo
-  // Exemplo: https://handlebarsjs.com/guide/
-  // ou até mesmo regex
-  // Exemplo: https://developer.mozilla.org/en-US/docs/Web/JavaScript/Guide/Regular_Expressios
-  // ou alguma biblioteca tipo mustache
-  // Exemplo:
-
   const injectedPrompt = CONFIG.prompt.replace(
     "{{ replace }}",
     previousNodeResult.result ? JSON.stringify(previousNodeResult.result) : ""
@@ -85,8 +85,15 @@ export const OllamaRunner = async ({ executionId, nodeId }: OllamaRunner) => {
     headers: { "Content-Type": "application/json" },
   });
 
+  if (!response.ok) {
+    throw new Error(
+      `Ollama API request failed with status ${response.status}: ${await response.text()}`
+    );
+  }
+
   const res_body = await response.json();
 
+  // 1. Salva o resultado do nó atual
   await db.insert(node_results).values({
     nodeId,
     executionId,
@@ -96,13 +103,14 @@ export const OllamaRunner = async ({ executionId, nodeId }: OllamaRunner) => {
     updatedAt: new Date(),
   });
 
+  // 2. Encontra todas as arestas de saída para encadear as próximas tarefas
   const source_edges = await db
-    .select()
+    .select({ targetNodeId: edges.targetNodeId })
     .from(edges)
     .where(eq(edges.sourceNodeId, nodeId));
 
   if (source_edges.length === 0) {
-    console.log(`No outgoing edges from node ${nodeId}. Execution ends here.`);
+    console.log(`[|] Fim do fluxo no nó ${nodeId}. Execução concluída.`);
     await db
       .update(executions)
       .set({
@@ -114,35 +122,24 @@ export const OllamaRunner = async ({ executionId, nodeId }: OllamaRunner) => {
     return;
   }
 
+  // 3. Busca os detalhes de todos os nós de destino de uma vez
   const targetNodeIds = source_edges.map((edge) => edge.targetNodeId);
+  const targetNodes = await db
+    .select({ id: nodes.id, type: nodes.type })
+    .from(nodes)
+    .where(inArray(nodes.id, targetNodeIds));
 
-  if (targetNodeIds.length > 0) {
-    const targetNodes = await db
-      .select()
-      .from(nodes)
-      .where(inArray(nodes.id, targetNodeIds))
-      .all();
+  // 4. Publica uma nova mensagem para cada nó de destino em paralelo
+  const publishPromises = targetNodes.map((node) => {
+    const routingKey = getNodeRoutingKey(node.type);
+    return publish(
+      routingKey,
+      JSON.stringify({
+        nodeId: node.id,
+        executionId,
+      })
+    );
+  });
 
-    const nodesMap = new Map(targetNodes.map((node) => [node.id, node]));
-
-    // MIGRAR ISSO AQUI PARA PROMISE.ALL?
-    for (const edge of source_edges) {
-      const targetNode = nodesMap.get(edge.targetNodeId);
-
-      if (!targetNode) {
-        console.error(`Target node with ID ${edge.targetNodeId} not found.`);
-        continue;
-      }
-      if (!producer) {
-        throw new Error("Producer not initialized");
-      }
-      await producer.publish(
-        ROUTING_KEYS.ollama,
-        JSON.stringify({
-          nodeId: targetNode.id,
-          executionId,
-        })
-      );
-    }
-  }
+  await Promise.all(publishPromises);
 };

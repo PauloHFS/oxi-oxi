@@ -1,29 +1,36 @@
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import {
+  pgTable,
+  text,
+  timestamp,
+  integer,
+  varchar,
+  jsonb,
+} from "drizzle-orm/pg-core";
 import { executions, flows } from "./flows";
 
-export const nodes = sqliteTable("nodes", {
-  id: text("id").primaryKey(),
-  flowId: text("flow_id")
+export const nodes = pgTable("nodes", {
+  id: varchar("id").primaryKey(),
+  flowId: varchar("flow_id")
     .notNull()
     .references(() => flows.id),
-  type: text("type").notNull(), // "API", "WEBHOOK", "OLLAMA"
-  name: text("name").notNull(),
-  data: text("data", { mode: "json" }).notNull(),
+  type: varchar("type").notNull(), // "API", "WEBHOOK", "OLLAMA"
+  name: varchar("name").notNull(),
+  data: jsonb("data").notNull(),
   positionX: integer("position_x").notNull(),
   positionY: integer("position_y").notNull(),
-  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
-  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+  createdAt: timestamp("created_at").notNull(),
+  updatedAt: timestamp("updated_at").notNull(),
 });
 
-export const node_results = sqliteTable("node_results", {
-  id: text("id").primaryKey(),
-  executionId: text("execution_id")
+export const node_results = pgTable("node_results", {
+  id: varchar("id").primaryKey(),
+  executionId: varchar("execution_id")
     .notNull()
     .references(() => executions.id),
-  nodeId: text("node_id")
+  nodeId: varchar("node_id")
     .notNull()
     .references(() => nodes.id),
-  result: text("result", { mode: "json" }).notNull(),
-  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
-  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+  result: jsonb("result").notNull(),
+  createdAt: timestamp("created_at").notNull(),
+  updatedAt: timestamp("updated_at").notNull(),
 });

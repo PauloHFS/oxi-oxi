@@ -1,33 +1,40 @@
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import {
+  pgTable,
+  text,
+  timestamp,
+  integer,
+  varchar,
+  jsonb,
+} from "drizzle-orm/pg-core";
 
-export const flows = sqliteTable("flows", {
-  id: text("id").primaryKey(),
-  userId: text("user_id").notNull(),
-  name: text("name").notNull(),
+export const flows = pgTable("flows", {
+  id: varchar("id").primaryKey(),
+  userId: varchar("user_id").notNull(),
+  name: varchar("name").notNull(),
   description: text("description"),
-  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
-  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+  createdAt: timestamp("created_at").notNull(),
+  updatedAt: timestamp("updated_at").notNull(),
 });
 
-export const flowVersions = sqliteTable("flow_versions", {
-  id: text("id").primaryKey(),
-  flowId: text("flow_id")
+export const flowVersions = pgTable("flow_versions", {
+  id: varchar("id").primaryKey(),
+  flowId: varchar("flow_id")
     .notNull()
     .references(() => flows.id),
   version: integer("version").notNull(),
-  nodesData: text("nodes_data", { mode: "json" }).notNull(),
-  edgesData: text("edges_data", { mode: "json" }).notNull(),
-  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  nodesData: jsonb("nodes_data").notNull(),
+  edgesData: jsonb("edges_data").notNull(),
+  createdAt: timestamp("created_at").notNull(),
 });
 
-export const executions = sqliteTable("executions", {
-  id: text("id").primaryKey(),
-  flowId: text("flow_id")
+export const executions = pgTable("executions", {
+  id: varchar("id").primaryKey(),
+  flowId: varchar("flow_id")
     .notNull()
     .references(() => flows.id),
-  status: text("status").notNull(), // e.g., 'pending', 'running', 'completed', 'failed'
-  startedAt: integer("started_at", { mode: "timestamp" }),
-  completedAt: integer("completed_at", { mode: "timestamp" }),
-  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
-  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+  status: varchar("status").notNull(), // e.g., 'pending', 'running', 'completed', 'failed'
+  startedAt: timestamp("started_at"),
+  completedAt: timestamp("completed_at"),
+  createdAt: timestamp("created_at").notNull(),
+  updatedAt: timestamp("updated_at").notNull(),
 });

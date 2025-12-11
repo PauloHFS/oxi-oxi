@@ -1,213 +1,125 @@
-import amqp from "amqplib";
-import { EventEmitter } from "events";
+import type {
+  AmqpConnectionManager,
+  ChannelWrapper,
+} from "amqp-connection-manager";
+import amqp from "amqp-connection-manager";
+import type { Channel, ConsumeMessage } from "amqplib";
 
-export class RabbitMQClient extends EventEmitter {
-  private static instance: RabbitMQClient;
-  private connection: amqp.ChannelModel | null = null;
-  private channel: amqp.ConfirmChannel | null = null;
-  private isConnecting = false;
-  private readonly amqpUrl: string;
-  private readonly exchangeName: string;
+// Type for the message processing function remains the same
+export type MessageProcessor = (
+  channel: Channel,
+  message: ConsumeMessage
+) => Promise<void>;
 
-  private constructor(amqpUrl: string, exchangeName: string) {
-    super(); // Inicializa o EventEmitter
-    this.amqpUrl = amqpUrl;
-    this.exchangeName = exchangeName;
+// --- Module-scoped state ---
+let connection: AmqpConnectionManager;
+let publishChannel: ChannelWrapper;
+let exchangeName: string;
+
+/**
+ * Initializes the connection manager and the main publishing channel.
+ * This function should be called once when the application starts.
+ * @param amqpUrl The RabbitMQ connection URL.
+ * @param exName The name of the topic exchange to use.
+ */
+export function initializeRabbitMQ(amqpUrl: string, exName: string): void {
+  // Prevent re-initialization
+  if (connection) {
+    return;
   }
 
-  public static getInstance(
-    amqpUrl: string,
-    exchangeName: string
-  ): RabbitMQClient {
-    if (!RabbitMQClient.instance) {
-      RabbitMQClient.instance = new RabbitMQClient(amqpUrl, exchangeName);
-    }
-    return RabbitMQClient.instance;
+  exchangeName = exName;
+  connection = amqp.connect([amqpUrl], {
+    heartbeatIntervalInSeconds: 30,
+  });
+
+  connection.on("connect", () => console.log(`[✓] RabbitMQ: Conectado!`));
+  connection.on("disconnect", (err) =>
+    console.error("[✗] RabbitMQ: Desconectado.", err?.err.message)
+  );
+
+  // Setup a single channel wrapper for publishing and asserting the exchange
+  publishChannel = connection.createChannel({
+    json: false,
+    setup: async (channel: Channel) => {
+      await channel.assertExchange(exchangeName, "topic", { durable: true });
+      console.log(`[✓] RabbitMQ: Exchange '${exchangeName}' assertada.`);
+    },
+  });
+
+  console.log("[...] RabbitMQ: Gerenciador de conexão inicializado.");
+}
+
+/**
+ * Publishes a message to the pre-configured exchange.
+ * Messages are published as persistent.
+ * @param routingKey The routing key for the message.
+ * @param msg The message content (string).
+ */
+export async function publish(routingKey: string, msg: string): Promise<void> {
+  if (!publishChannel) {
+    throw new Error(
+      "RabbitMQ não foi inicializado. Chame initializeRabbitMQ() primeiro."
+    );
   }
 
-  public async connect(): Promise<amqp.Channel> {
-    if (this.channel) {
-      return this.channel;
-    }
+  try {
+    await publishChannel.publish(exchangeName, routingKey, Buffer.from(msg), {
+      persistent: true,
+      contentType: "application/json",
+    });
+    console.log(`[✓] RabbitMQ: Mensagem publicada para '${routingKey}'.`);
+  } catch (error) {
+    console.error(
+      `[✗] RabbitMQ: Falha na publicação para '${routingKey}':`,
+      (error as Error).message
+    );
+    // The channel wrapper handles retries, so we just log the error.
+  }
+}
 
-    if (this.isConnecting) {
-      return this.waitForConnection();
-    }
+/**
+ * Sets up a subscriber for a given queue.
+ * It creates a dedicated channel for the consumer to manage prefetch and acks independently.
+ * @param queueName The name of the queue.
+ * @param routingKey The routing key to bind the queue to the exchange.
+ * @param processMessage The function to process incoming messages.
+ * @param prefetch The number of messages to fetch at a time.
+ */
+export async function subscribe(
+  queueName: string,
+  routingKey: string,
+  processMessage: MessageProcessor,
+  prefetch: number = 10
+): Promise<void> {
+  if (!connection) {
+    throw new Error(
+      "RabbitMQ não foi inicializado. Chame initializeRabbitMQ() primeiro."
+    );
+  }
 
-    this.isConnecting = true;
-    try {
-      this.connection = await amqp.connect(this.amqpUrl, { heartbeat: 30 });
-      this.channel = await this.connection.createConfirmChannel();
-      await this.channel.assertExchange(this.exchangeName, "topic", {
-        durable: true,
-      });
-
-      this.connection.on("close", (err) => {
-        console.error(
-          "Conexão com RabbitMQ fechada.",
-          err ? `Erro: ${err.message}` : ""
-        );
-        this.handleDisconnect();
-      });
-
-      this.connection.on("error", (err) => {
-        console.error("Erro na conexão com RabbitMQ.", `Erro: ${err.message}`);
-      });
-
+  connection.createChannel({
+    json: false,
+    setup: async (channel: Channel) => {
+      await channel.assertQueue(queueName, { durable: true });
+      await channel.bindQueue(queueName, exchangeName, routingKey);
+      await channel.prefetch(prefetch);
       console.log(
-        `[✓] Conectado ao RabbitMQ e exchange '${this.exchangeName}' assertada.`
+        `[✓] RabbitMQ: Fila '${queueName}' vinculada com prefetch(${prefetch}).`
       );
-      this.emit("connected", this.channel); // Emite evento de conexão
-      return this.channel;
-    } catch (error) {
-      console.error(
-        "Erro ao conectar ou assertar RabbitMQ:",
-        (error as Error).message
-      );
-      this.handleDisconnect();
-      throw error;
-    } finally {
-      this.isConnecting = false;
-    }
-  }
 
-  private waitForConnection(): Promise<amqp.Channel> {
-    return new Promise((resolve) => {
-      const checkInterval = setInterval(() => {
-        if (this.channel) {
-          clearInterval(checkInterval);
-          resolve(this.channel);
+      await channel.consume(
+        queueName,
+        async (msg: ConsumeMessage | null) => {
+          if (msg) {
+            await processMessage(channel, msg);
+          }
+        },
+        {
+          noAck: false, // Manual acknowledgment is required
         }
-      }, 500);
-    });
-  }
-
-  private handleDisconnect(): void {
-    this.connection = null;
-    this.channel = null;
-    this.emit("disconnected"); // Emite evento de desconexão
-    setTimeout(() => this.reconnect(), 5000);
-  }
-
-  private async reconnect(): Promise<void> {
-    try {
-      await this.connect();
-    } catch (error) {
-      console.error(
-        "Falha na reconexão. Tentando novamente...",
-        (error as Error).message
       );
-    }
-  }
-}
-
-export class RabbitMQPublisher {
-  private readonly client: RabbitMQClient;
-  private readonly exchangeName: string;
-
-  constructor(client: RabbitMQClient, exchangeName: string) {
-    this.client = client;
-    this.exchangeName = exchangeName;
-  }
-
-  async publish(routingKey: string, msg: string): Promise<void> {
-    const channel = await this.client.connect();
-
-    try {
-      const sent = channel.publish(
-        this.exchangeName,
-        routingKey,
-        Buffer.from(msg),
-        { persistent: true }
-      );
-      if (!sent) {
-        await new Promise<void>((resolve) => channel.once("drain", resolve));
-      }
-      console.log(`[✓] Mensagem publicada para '${routingKey}'.`);
-    } catch (error) {
-      if (error instanceof Error) {
-        console.error("Falha na publicação:", error.message);
-      } else {
-        console.error("Erro desconhecido na publicação.");
-      }
-      throw error;
-    }
-  }
-}
-
-export class RabbitMQSubscriber {
-  private readonly client: RabbitMQClient;
-  private readonly queueName: string;
-  private readonly exchangeName: string;
-  private readonly routingKey: string;
-  private processMessageFn: (message: string) => Promise<void>;
-
-  constructor(
-    client: RabbitMQClient,
-    queueName: string,
-    exchangeName: string,
-    routingKey: string
-  ) {
-    this.client = client;
-    this.queueName = queueName;
-    this.exchangeName = exchangeName;
-    this.routingKey = routingKey;
-    this.processMessageFn = () =>
-      new Promise(() => {
-        throw new Error("Process Message FN Missing");
-      });
-  }
-
-  public async setup(): Promise<RabbitMQSubscriber> {
-    const channel = await this.client.connect();
-    try {
-      await channel.assertQueue(this.queueName, { durable: true });
-      await channel.bindQueue(
-        this.queueName,
-        this.exchangeName,
-        this.routingKey
-      );
-      console.log(`[✓] Fila '${this.queueName}' vinculada à exchange.`);
-      return this;
-    } catch (error) {
-      console.error(
-        `[✗] Erro ao configurar o subscriber:`,
-        (error as Error).message
-      );
-      throw error;
-    }
-  }
-
-  public async startConsuming(
-    processMessageFn: (message: string) => Promise<void>
-  ): Promise<void> {
-    this.processMessageFn = processMessageFn;
-    await this.registerConsumer();
-
-    // Re-registra o consumidor em caso de reconexão
-    this.client.on("connected", () => {
-      this.registerConsumer().catch(console.error);
-    });
-  }
-
-  private async registerConsumer(): Promise<void> {
-    const channel = await this.client.connect();
-    if (!channel) {
-      return; // Retorna se o canal não estiver pronto
-    }
-
-    channel.consume(this.queueName, async (msg: amqp.ConsumeMessage | null) => {
-      if (msg) {
-        try {
-          const content = msg.content.toString();
-          await this.processMessageFn(content);
-          channel.ack(msg);
-          console.log(`[✓] Mensagem processada: '${content}'`);
-        } catch (error) {
-          console.error(`[✗] Erro no processamento:`, (error as Error).message);
-          channel.nack(msg, false, false);
-        }
-      }
-    });
-  }
+      console.log(`[✓] RabbitMQ: Consumidor iniciado na fila '${queueName}'.`);
+    },
+  });
 }

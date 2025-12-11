@@ -1,8 +1,12 @@
-import { drizzle } from "drizzle-orm/libsql";
-import { createClient } from "@libsql/client";
+import { drizzle } from "drizzle-orm/node-postgres";
+import { Pool } from "pg";
 
-const client = createClient({
-	url: process.env.DATABASE_URL || "",
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL is not set in .env file");
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
 });
 
-export const db = drizzle({ client });
+export const db = drizzle(pool);

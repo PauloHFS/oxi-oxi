@@ -6,11 +6,24 @@ import { edges } from "@/db/schema/edges";
 import { eq, and, inArray } from "drizzle-orm";
 import { z } from "zod";
 import { executions } from "@/db/schema/flows";
-import { producer, ROUTING_KEYS } from "@/queue";
+import { publish, ROUTING_KEYS } from "@/queue";
 
-interface ApiRunner extends Runner {}
+const getNodeRoutingKey = (nodeType: string): string => {
+  switch (nodeType) {
+    case "API":
+      return ROUTING_KEYS.api;
+    case "OLLAMA":
+      return ROUTING_KEYS.ollama;
+    case "WEBHOOK":
+      return ROUTING_KEYS.webhook;
+    default:
+      throw new Error(`Tipo de nó desconhecido para roteamento: ${nodeType}`);
+  }
+};
 
-export const ApiRunner = async ({ executionId, nodeId }: ApiRunner) => {
+interface ApiRunnerPayload extends Runner {}
+
+export const ApiRunner = async ({ executionId, nodeId }: ApiRunnerPayload) => {
   const node = await db.select().from(nodes).where(eq(nodes.id, nodeId)).get();
 
   if (!node) {
@@ -29,7 +42,7 @@ export const ApiRunner = async ({ executionId, nodeId }: ApiRunner) => {
     })
     .parse(node.data);
 
-  // pega o id do node anterior
+  // Pega o id do node anterior
   const incoming_edge = await db
     .select()
     .from(edges)
@@ -41,7 +54,7 @@ export const ApiRunner = async ({ executionId, nodeId }: ApiRunner) => {
     throw new Error(`No incoming edge found for node ${nodeId}`);
   }
 
-  // pegar o resultado do node anterior
+  // Pegar o resultado do node anterior
   const previousNodeResult = await db
     .select()
     .from(node_results)
@@ -62,11 +75,8 @@ export const ApiRunner = async ({ executionId, nodeId }: ApiRunner) => {
   }
 
   let injectedBody;
-
   if (CONFIG.body) {
-    // Deep clone para manipular objetos/arrays aninhados com segurança
     const tempBody = JSON.parse(JSON.stringify(CONFIG.body));
-
     if (
       Array.isArray(tempBody.embeds) &&
       tempBody.embeds.length > 0 &&
@@ -77,10 +87,7 @@ export const ApiRunner = async ({ executionId, nodeId }: ApiRunner) => {
         .replace("{{ replace }}", previousNodeResult.result as string)
         .replace(/^<think>[\s\S]*?<\/think>\s*/, "");
     }
-
     injectedBody = JSON.stringify(tempBody);
-  } else {
-    injectedBody = undefined;
   }
 
   const response = await fetch(CONFIG.url, {
@@ -90,27 +97,7 @@ export const ApiRunner = async ({ executionId, nodeId }: ApiRunner) => {
   });
 
   if (!response.ok) {
-    Promise.all([
-      db.insert(node_results).values({
-        nodeId,
-        executionId,
-        id: randomUUIDv7(),
-        result: JSON.stringify({
-          status: response.status,
-          statusText: response.statusText,
-        }),
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      }),
-      db
-        .update(executions)
-        .set({
-          status: "error",
-          completedAt: new Date(),
-          updatedAt: new Date(),
-        })
-        .where(eq(executions.id, executionId)),
-    ]);
+    // Apenas lançamos o erro. O consumidor principal cuidará de NACK e logging.
     throw new Error(
       `API request failed with status ${response.status}: ${response.statusText}`
     );
@@ -118,6 +105,7 @@ export const ApiRunner = async ({ executionId, nodeId }: ApiRunner) => {
 
   const res_body = await response.json();
 
+  // 1. Salva o resultado do nó atual
   await db.insert(node_results).values({
     nodeId,
     executionId,
@@ -127,13 +115,14 @@ export const ApiRunner = async ({ executionId, nodeId }: ApiRunner) => {
     updatedAt: new Date(),
   });
 
+  // 2. Encontra todas as arestas de saída para encadear as próximas tarefas
   const source_edges = await db
-    .select()
+    .select({ targetNodeId: edges.targetNodeId })
     .from(edges)
     .where(eq(edges.sourceNodeId, nodeId));
 
   if (source_edges.length === 0) {
-    console.log(`No outgoing edges from node ${nodeId}. Execution ends here.`);
+    console.log(`[|] Fim do fluxo no nó ${nodeId}. Execução concluída.`);
     await db
       .update(executions)
       .set({
@@ -145,36 +134,24 @@ export const ApiRunner = async ({ executionId, nodeId }: ApiRunner) => {
     return;
   }
 
+  // 3. Busca os detalhes de todos os nós de destino de uma vez
   const targetNodeIds = source_edges.map((edge) => edge.targetNodeId);
+  const targetNodes = await db
+    .select({ id: nodes.id, type: nodes.type })
+    .from(nodes)
+    .where(inArray(nodes.id, targetNodeIds));
 
-  if (targetNodeIds.length > 0) {
-    const targetNodes = await db
-      .select()
-      .from(nodes)
-      .where(inArray(nodes.id, targetNodeIds))
-      .all();
+  // 4. Publica uma nova mensagem para cada nó de destino em paralelo
+  const publishPromises = targetNodes.map((node) => {
+    const routingKey = getNodeRoutingKey(node.type);
+    return publish(
+      routingKey,
+      JSON.stringify({
+        nodeId: node.id,
+        executionId,
+      })
+    );
+  });
 
-    const nodesMap = new Map(targetNodes.map((node) => [node.id, node]));
-
-    // MIGRAR ISSO AQUI PARA PROMISE.ALL?
-    for (const edge of source_edges) {
-      const targetNode = nodesMap.get(edge.targetNodeId);
-
-      if (!targetNode) {
-        console.error(`Target node with ID ${edge.targetNodeId} not found.`);
-        continue;
-      }
-
-      if (!producer) {
-        throw new Error("Producer not initialized");
-      }
-      await producer.publish(
-        ROUTING_KEYS.api,
-        JSON.stringify({
-          nodeId: targetNode.id,
-          executionId,
-        })
-      );
-    }
-  }
+  await Promise.all(publishPromises);
 };
